@@ -29,14 +29,20 @@ import gzip
 import os
 import plistlib
 import subprocess
+import re
 import sys
 import urlparse
 import xattr
 from xml.dom import minidom
 from xml.parsers.expat import ExpatError
+from operator import itemgetter
+from distutils.version import LooseVersion
 
 
 DEFAULT_SUCATALOGS = {
+    '16': 'https://swscan.apple.com/content/catalogs/others/'
+          'index-10.12-10.11-10.10-10.9'
+          '-mountainlion-lion-snowleopard-leopard.merged-1.sucatalog',
     '17': 'https://swscan.apple.com/content/catalogs/others/'
           'index-10.13-10.12-10.11-10.10-10.9'
           '-mountainlion-lion-snowleopard-leopard.merged-1.sucatalog',
@@ -50,6 +56,62 @@ SEED_CATALOGS_PLIST = (
     '/System/Library/PrivateFrameworks/Seeding.framework/Versions/Current/'
     'Resources/SeedCatalogs.plist'
 )
+
+
+def get_board_id():
+    '''Gets the local system board ID'''
+    ioreg_cmd = ['ioreg', '-p', 'IODeviceTree', '-r', '-n', '/', '-d', '1']
+    try:
+        ioreg_output = subprocess.check_output(ioreg_cmd).splitlines()
+        for line in ioreg_output:
+            if 'board-id' in line:
+                board_id = line.split(" ")[-1]
+                board_id = board_id[board_id.find('<"')+2:board_id.find('">')]
+                return board_id
+    except subprocess.CalledProcessError, err:
+        raise ReplicationError(err)
+
+
+def is_a_vm():
+    '''Determines if the script is being run in a virtual machine'''
+    sysctl_cmd = ['/usr/sbin/sysctl', 'machdep.cpu.features']
+    try:
+        sysctl_output = subprocess.check_output(sysctl_cmd)
+        cpu_features = sysctl_output.split(" ")
+        is_vm = False
+        for i in range(len(cpu_features)):
+            if cpu_features[i] == "VMM":
+                is_vm = True
+    except subprocess.CalledProcessError, err:
+        raise ReplicationError(err)
+    return is_vm
+
+
+def get_hw_model():
+    '''Gets the local system ModelIdentifier'''
+    sysctl_cmd = ['/usr/sbin/sysctl', 'hw.model']
+    try:
+        sysctl_output = subprocess.check_output(sysctl_cmd)
+        hw_model = sysctl_output.split(" ")[-1].split("\n")[0]
+    except subprocess.CalledProcessError, err:
+        raise ReplicationError(err)
+    return hw_model
+
+
+def get_current_build_info():
+    '''Gets the local system build'''
+    build_info = []
+    sw_vers_cmd = ['/usr/bin/sw_vers']
+    try:
+        sw_vers_output = subprocess.check_output(sw_vers_cmd).splitlines()
+        for line in sw_vers_output:
+            if 'ProductVersion' in line:
+                build_info.insert(0, line.split("\t")[-1])
+            if 'BuildVersion' in line:
+                build_info.insert(1, line.split("\t")[-1])
+    except subprocess.CalledProcessError, err:
+        raise ReplicationError(err)
+    return build_info
 
 
 def get_seeding_program(sucatalog_url):
@@ -99,13 +161,13 @@ def make_sparse_image(volume_name, output_path):
         exit(-1)
 
 
-def make_compressed_dmg(app_path, diskimagepath):
+def make_compressed_dmg(app_path, diskimagepath, volume_name):
     """Returns path to newly-created compressed r/o disk image containing
     Install macOS.app"""
 
     print ('Making read-only compressed disk image containing %s...'
            % os.path.basename(app_path))
-    cmd = ['/usr/bin/hdiutil', 'create', '-fs', 'HFS+',
+    cmd = ['/usr/bin/hdiutil', 'create', '-volname', volume_name, '-fs', 'HFS+',
            '-srcfolder', app_path, diskimagepath]
     try:
         subprocess.check_call(cmd)
@@ -197,7 +259,7 @@ def replicate_url(full_url,
         if attempt_resume:
             curl_cmd.extend(['-C', '-'])
     curl_cmd.append(full_url)
-    print "Downloading %s..." % full_url
+    # print "Downloading %s..." % full_url
     try:
         subprocess.check_call(curl_cmd)
     except subprocess.CalledProcessError, err:
@@ -285,6 +347,29 @@ def parse_dist(filename):
     return dist_info
 
 
+def get_board_ids(filename):
+    '''Parses a softwareupdate dist file, returning a list of supported
+    Board IDs'''
+    supported_board_ids = ""
+    with open(filename) as search:
+        for line in search:
+            line = line.rstrip()  # remove '\n' at end of line
+            if 'boardIds' in line:
+                supported_board_ids = line.split(" ")[-1][:-1]
+                return supported_board_ids
+
+
+def get_unsupported_models(filename):
+    '''Parses a softwareupdate dist file, returning a list of non-supported
+    ModelIdentifiers'''
+    unsupported_models = ""
+    with open(filename) as search:
+        for line in search:
+            line = line.rstrip()  # remove '\n' at end of line
+            if 'nonSupportedModels' in line:
+                unsupported_models = line.split(" ")[-1][:-1]
+                return unsupported_models
+
 def download_and_parse_sucatalog(sucatalog, workdir, ignore_cache=False):
     '''Downloads and returns a parsed softwareupdate catalog'''
     try:
@@ -350,9 +435,21 @@ def os_installer_product_info(catalog, workdir, ignore_cache=False):
             print >> sys.stderr, 'Could not replicate %s: %s' % (dist_url, err)
         dist_info = parse_dist(dist_path)
         product_info[product_key]['DistributionPath'] = dist_path
+        unsupported_models = get_unsupported_models(dist_path)
+        product_info[product_key]['UnsupportedModels'] = unsupported_models
+        board_ids = get_board_ids(dist_path)
+        product_info[product_key]['BoardIDs'] = board_ids
         product_info[product_key].update(dist_info)
 
     return product_info
+
+
+def get_lowest_version(current_item, lowest_item):
+    '''Compares versions between two values and returns the lowest value'''
+    if LooseVersion(current_item) < LooseVersion(lowest_item):
+        return current_item
+    else:
+        return lowest_item
 
 
 def replicate_product(catalog, product_id, workdir, ignore_cache=False):
@@ -394,6 +491,12 @@ def find_installer_app(mountpoint):
 
 def main():
     '''Do the main thing here'''
+
+    print ('\n'
+           'installinstallmacos.py - get macOS installers '
+           'from the Apple software catalog'
+           '\n')
+
     if os.getuid() != 0:
         sys.exit('This command requires root (to install packages), so please '
                  'run again with sudo or as root.')
@@ -421,7 +524,41 @@ def main():
                         'less available disk space and is faster.')
     parser.add_argument('--ignore-cache', action='store_true',
                         help='Ignore any previously cached files.')
+    parser.add_argument('--build', metavar='build_version',
+                        default='',
+                        help='Specify a specific build to search for and '
+                        'download.')
+    parser.add_argument('--list', action='store_true',
+                        help='Output the available updates to a plist '
+                        'and quit.')
+    parser.add_argument('--current', action='store_true',
+                        help='Automatically select the current installed '
+                        'build.')
+    parser.add_argument('--validate', action='store_true',
+                        help='Validate builds for board ID and hardware model '
+                        'and only show appropriate builds.')
+    parser.add_argument('--auto', action='store_true',
+                        help='Automatically select the appropriate valid build '
+                        'for the current device.')
+    parser.add_argument('--version', metavar='match_version',
+                        default='',
+                        help='Selects the lowest valid build ID matching'
+                        'the selected version.')
     args = parser.parse_args()
+
+    # show this Mac's info
+    hw_model = get_hw_model()
+    board_id = get_board_id()
+    build_info = get_current_build_info()
+    is_vm = is_a_vm()
+
+    print "This Mac:"
+    if is_vm == True:
+        print "Identified as a Virtual Machine"
+    print "%-17s: %s" % ('Model Identifier', hw_model)
+    print "%-17s: %s" % ('Board ID', board_id)
+    print "%-17s: %s" % ('OS Version', build_info[0])
+    print "%-17s: %s\n" % ('Build ID', build_info[1])
 
     if args.catalogurl:
         su_catalog_url = args.catalogurl
@@ -450,21 +587,143 @@ def main():
             'No macOS installer products found in the sucatalog.')
         exit(-1)
 
+    output_plist = "%s/softwareupdate.plist" % args.workdir
+    pl = {}
+    pl['result'] = []
+
+    valid_build_found = False
+
     # display a menu of choices (some seed catalogs have multiple installers)
-    print '%2s %12s %10s %8s %11s  %s' % ('#', 'ProductID', 'Version',
-                                          'Build', 'Post Date', 'Title')
+    print '%2s  %-15s %-10s %-8s %-11s %-30s %s' % ('#', 'ProductID', 'Version',
+                                     'Build', 'Post Date', 'Title', 'Notes')
     for index, product_id in enumerate(product_info):
-        print '%2s %12s %10s %8s %11s  %s' % (
+        not_valid = ''
+        if hw_model in product_info[product_id]['UnsupportedModels'] and is_vm == False:
+            not_valid = 'Unsupported Model Identifier'
+        elif board_id not in product_info[product_id]['BoardIDs'] and is_vm == False:
+            not_valid = 'Unsupported Board ID'
+        elif get_lowest_version(build_info[0],product_info[product_id]['version']) != build_info[0]:
+            not_valid = 'Unsupported macOS version'
+        else:
+            valid_build_found = True
+
+        print '%2s  %-15s %-10s %-8s %-11s %-30s %s' % (
             index + 1,
             product_id,
             product_info[product_id]['version'],
             product_info[product_id]['BUILD'],
             product_info[product_id]['PostDate'].strftime('%Y-%m-%d'),
-            product_info[product_id]['title']
+            product_info[product_id]['title'],
+            not_valid
         )
 
-    answer = raw_input(
-        '\nChoose a product to download (1-%s): ' % len(product_info))
+        # go through various options for automatically determining the answer:
+
+        # skip if build is not suitable for current device
+        # and a validation parameter was chosen
+        if not_valid and (args.validate or args.auto or args.version):
+            continue
+
+        # skip if a version is selected and it does not match
+        if args.version and args.version != product_info[product_id]['version']:
+            continue
+
+        # determine the lowest valid build ID and select this
+        # when using auto and version options
+        if (args.auto or args.version) and 'Beta' not in product_info[product_id]['title']:
+            try:
+                lowest_valid_build
+            except NameError:
+                lowest_valid_build = product_info[product_id]['BUILD']
+                answer = index+1
+            else:
+                lowest_valid_build = get_lowest_version(
+                                        product_info[product_id]['BUILD'],
+                                        lowest_valid_build)
+                if lowest_valid_build == product_info[product_id]['BUILD']:
+                    answer = index+1
+
+        # Write this build info to plist
+        pl_index =  {'index': index+1,
+                'product_id': product_id,
+                'version': product_info[product_id]['version'],
+                'build': product_info[product_id]['BUILD'],
+                'title': product_info[product_id]['title'],
+                }
+        pl['result'].append(pl_index)
+
+        if args.build:
+            # automatically select matching build ID if build option used
+            if args.build == product_info[product_id]['BUILD']:
+                answer = index+1
+                break
+
+        elif args.current:
+            # automatically select matching build ID if current option used
+            if os_build == product_info[product_id]['BUILD']:
+                answer = index+1
+                break
+
+    # Stop here if no valid builds found
+    if valid_build_found == False:
+        print 'No valid build found for this hardware'
+        exit(0)
+
+    # Output a plist of available updates and quit if list option chosen
+    if args.list:
+        plistlib.writePlist(pl, output_plist)
+        exit(0)
+
+    # check for validity of specified build if argument supplied
+    if args.build:
+        try:
+            answer
+        except NameError:
+            print ('\n'
+                   'Build %s is not available. '
+                   'Run again without --build argument '
+                   'to select a valid build to download.\n' % args.build)
+            exit(0)
+        else:
+            print '\nBuild %s available. Downloading #%s...\n' % (args.build, answer)
+    elif args.current:
+        try:
+            answer
+        except NameError:
+            print ('\n'
+                   'Build %s is not available. '
+                   'Run again without --current argument '
+                   'to select a valid build to download.\n' % os_build)
+            exit(0)
+        else:
+            print '\nBuild %s available. Downloading #%s...\n' % (os_build, answer)
+    elif args.version:
+        try:
+            answer
+        except NameError:
+            print ('\n'
+                   'Item # %s is not available. '
+                   'Run again without --version argument '
+                   'to select a valid build to download.\n' % args.version)
+            exit(0)
+        else:
+            print '\nBuild %s selected. Downloading #%s...\n' % (lowest_valid_build, answer)
+    elif args.auto:
+        try:
+            answer
+        except NameError:
+            print ('\n'
+                   'No valid version available. '
+                   'Run again without --auto argument '
+                   'to select a valid build to download.\n')
+            exit(0)
+        else:
+            print '\nBuild %s selected. Downloading #%s...\n' % (lowest_valid_build, answer)
+    else:
+        # default option to interactively offer selection
+        answer = raw_input(
+                '\nChoose a product to download (1-%s): ' % len(product_info))
+
     try:
         index = int(answer) - 1
         if index < 0:
@@ -517,7 +776,7 @@ def main():
                 os.unlink(compressed_diskimagepath)
             app_path = find_installer_app(mountpoint)
             if app_path:
-                make_compressed_dmg(app_path, compressed_diskimagepath)
+                make_compressed_dmg(app_path, compressed_diskimagepath, volname)
             # unmount sparseimage
             unmountdmg(mountpoint)
             # delete sparseimage since we don't need it any longer
